@@ -1,14 +1,17 @@
 extern crate clap;
 
 use clap::{Arg, App};
-use indicatif::{ProgressBar, ProgressStyle, HumanBytes};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use console::style as console_style;
+use ctrlc;
 
 fn main() {
     let matches = App::new("Rget")
@@ -19,14 +22,15 @@ fn main() {
                 .required(true)
                 .takes_value(true)
                 .index(1)
-                .help("url to download"),
+                .help("URL to download"),
         )
         .get_matches();
     let url = matches.value_of("URL").unwrap();
+
     println!("{}", url);
 
     let start_time = Instant::now();
-    let result = download(url, false);
+    let result = download_with_pause(url, false);
     let duration = start_time.elapsed();
 
     log_download(url, &result, duration).expect("Failed to log download");
@@ -61,83 +65,92 @@ fn create_progress_bar(quiet_mode: bool, msg: &str, length: Option<u64>) -> Prog
     bar
 }
 
-fn download(target: &str, quiet_mode: bool) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-    let mut response = client.get(target).send()?;
+fn sanitize_filename(filename: &str) -> String {
+    filename.chars().filter(|c| c.is_alphanumeric() || *c == '.' || *c == '_').collect()
+}
 
-    print(
-        format!(
-            "HTTP request sent... {}",
-            custom_style(format!("{}", response.status()), "green")
-        ),
-        quiet_mode,
-    );
-    if response.status().is_success() {
+fn download_with_pause(url: &str, quiet_mode: bool) -> Result<(), Box<dyn Error>> {
+    let client = Client::new();
+    let original_filename = url.split('/').last().unwrap().to_string();
+    let sanitized_filename = sanitize_filename(&original_filename);
+    let filepath = Path::new(&sanitized_filename);
+    let mut file = if filepath.exists() {
+        OpenOptions::new().read(true).write(true).open(filepath)?
+    } else {
+        File::create(filepath)?
+    };
+
+    let downloaded = file.metadata()?.len();
+    let range_header = format!("bytes={}-", downloaded);
+
+    let request = client.get(url).header(RANGE, range_header.as_str());
+    let mut response = request.send()?;
+
+    if response.status().is_success() || response.status() == 206 {
+        print(
+            format!(
+                "HTTP request sent... {}",
+                custom_style(format!("{}", response.status()), "green")
+            ),
+            quiet_mode,
+        );
+
         let headers = response.headers().clone();
-        let ct_len: Option<u64> = headers
+        let total_size = headers
             .get(CONTENT_LENGTH)
             .and_then(|ct_len| ct_len.to_str().ok())
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                headers
+                    .get(CONTENT_RANGE)
+                    .and_then(|ct_range| {
+                        let ct_range = ct_range.to_str().ok()?;
+                        let total_size = ct_range.split('/').last()?;
+                        total_size.parse().ok()
+                    })
+            })
+            .unwrap_or(0);
 
         let ct_type = headers
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .unwrap_or("application/octet-stream");
 
-        match ct_len {
-            Some(len) => {
-                print(
-                    format!(
-                        "Length: {} ({})",
-                        custom_style(len.to_string(), "green"),
-                        custom_style(format!("{}", HumanBytes(len)), "red")
-                    ),
-                    quiet_mode,
-                );
-            }
-            None => {
-                print(format!("Length: {}", custom_style("unknown".to_string(), "red")), quiet_mode);
-            }
-        }
-
-        print(format!("Type: {}", custom_style(ct_type.to_string(), "green")), quiet_mode);
-
-        let fname = target.split('/').last().unwrap().to_string();
         print(
-            format!("Saving to: {}", custom_style(fname.clone(), "green")),
+            format!("Type: {}", custom_style(ct_type.to_string(), "green")),
             quiet_mode,
         );
 
-        let chunk_size = match ct_len {
-            Some(x) => x as usize / 99,
-            None => 1024usize, // default chunk size
-        };
+        let bar = create_progress_bar(quiet_mode, &sanitized_filename, Some(total_size));
+        bar.set_position(downloaded);
 
-        let mut buf = Vec::new();
-        let bar = create_progress_bar(quiet_mode, &fname, ct_len);
+        let chunk_size = 1024 * 64; // 64 KB chunks
+
+        let mut buffer = vec![0; chunk_size];
+
+        let paused = Arc::new(AtomicBool::new(false));
+        let p = paused.clone();
+        ctrlc::set_handler(move || {
+            p.store(true, Ordering::SeqCst);
+        }).expect("Error setting Ctrl-C handler");
 
         loop {
-            let mut buffer = vec![0; chunk_size];
-            let bcount = response.read(&mut buffer[..])?;
-            buffer.truncate(bcount);
-            if !buffer.is_empty() {
-                buf.extend(buffer.into_boxed_slice().into_vec().iter().cloned());
-                bar.inc(bcount as u64);
-            } else {
+            if paused.load(Ordering::SeqCst) {
+                println!("\nDownload paused. You can resume it by running the program again.");
                 break;
             }
+            let bytes_read = response.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&buffer[..bytes_read])?;
+            bar.inc(bytes_read as u64);
         }
 
         bar.finish();
-        save_to_file(&buf, &fname)?;
     }
 
-    Ok(())
-}
-
-fn save_to_file(buffer: &[u8], filename: &str) -> Result<(), Box<dyn Error>> {
-    let mut file = File::create(filename)?;
-    file.write_all(buffer)?;
     Ok(())
 }
 
