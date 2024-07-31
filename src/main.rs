@@ -5,8 +5,9 @@ use indicatif::{ProgressBar, ProgressStyle, HumanBytes};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use std::error::Error;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::time::Instant;
 use console::style as console_style;
 
 fn main() {
@@ -24,7 +25,13 @@ fn main() {
     let url = matches.value_of("URL").unwrap();
     println!("{}", url);
 
-    if let Err(e) = download(url, false) {
+    let start_time = Instant::now();
+    let result = download(url, false);
+    let duration = start_time.elapsed();
+
+    log_download(url, &result, duration).expect("Failed to log download");
+
+    if let Err(e) = result {
         eprintln!("Error: {}", e);
     }
 }
@@ -146,4 +153,19 @@ fn custom_style(msg: String, color: &str) -> console::StyledObject<String> {
         "red" => console_style(msg).red(),
         _ => console_style(msg),
     }
+}
+
+fn log_download(url: &str, result: &Result<(), Box<dyn Error>>, duration: std::time::Duration) -> Result<(), Box<dyn Error>> {
+    let log_message = match result {
+        Ok(_) => format!("SUCCESS: {} ({} seconds)\n", url, duration.as_secs()),
+        Err(e) => format!("FAILED: {} ({}) ({} seconds)\n", url, e, duration.as_secs()),
+    };
+
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("download.log")?;
+
+    log_file.write_all(log_message.as_bytes())?;
+    Ok(())
 }
